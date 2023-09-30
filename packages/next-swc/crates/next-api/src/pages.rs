@@ -560,6 +560,13 @@ impl PageEndpoint {
 
         let client_entry_chunk = client_module.as_root_chunk(Vc::upcast(client_chunking_context));
 
+        create_react_lodable_manifest(
+            Vc::upcast(client_main_module),
+            client_chunking_context,
+            this.pages_project.project().project_path(),
+        )
+        .await?;
+
         let mut client_chunks = client_chunking_context
             .evaluated_chunk_group(
                 client_entry_chunk,
@@ -614,7 +621,12 @@ impl PageEndpoint {
                 config.runtime,
             );
 
-            create_react_lodable_manifest(ssr_module).await?;
+            create_react_lodable_manifest(
+                ssr_module,
+                edge_chunking_context,
+                this.pages_project.project().client_root(),
+            )
+            .await?;
 
             let mut evaluatable_assets = edge_runtime_entries.await?.clone_value();
             let Some(evaluatable) = Vc::try_resolve_sidecast(ssr_module).await? else {
@@ -639,17 +651,55 @@ impl PageEndpoint {
                 config.runtime,
             );
 
-            create_react_lodable_manifest(ssr_module).await?;
+            // TODO: This should be higher level instead of chunk entry?
+            let lodable_modules = create_react_lodable_manifest(
+                ssr_module,
+                edge_chunking_context,
+                this.pages_project.project().client_root(),
+            )
+            .await?;
 
             let asset_path = get_asset_path_from_pathname(&this.pathname.await?, ".js");
 
             let ssr_entry_chunk_path_string = format!("pages{asset_path}");
             let ssr_entry_chunk_path = node_path.join(ssr_entry_chunk_path_string);
-            let ssr_entry_chunk =
+            let mut ssr_entry_chunk =
                 chunking_context.entry_chunk(ssr_entry_chunk_path, ssr_module, runtime_entries);
+
+            let x = *lodable_modules.await?;
+            let mut dynamic_entries = vec![];
+            if let Some(import_mapping) = x {
+                let (origin_module, import_sources) = &*import_mapping.await?;
+                println!("import_mapping: {:?}", import_sources);
+                for (import, module) in import_sources {
+                    let Some(module2) =
+                        Vc::try_resolve_sidecast::<Box<dyn turbopack_binding::turbopack::ecmascript::chunk::EcmascriptChunkPlaceable>>(module.clone()).await?
+                    else {
+                        bail!("module must be evaluatable");
+                    };
+                    let ee = chunking_context.entry_chunk(
+                        ssr_entry_chunk_path,
+                        module2,
+                        runtime_entries,
+                    );
+
+                    println!(
+                        "evaluated from {:#?} {:#?}",
+                        turbo_tasks::ValueToString::to_string(
+                            turbopack_binding::turbopack::core::module::Module::ident(
+                                module.clone()
+                            )
+                        )
+                        .await?,
+                        turbo_tasks::ValueToString::to_string(ee.ident()).await?
+                    );
+                    //dynamic_entries.push(ee);
+                }
+            }
 
             Ok(SsrChunk::NodeJs {
                 entry: ssr_entry_chunk,
+                dynamic_entries: Vc::cell(dynamic_entries),
             }
             .cell())
         }
@@ -811,14 +861,16 @@ impl PageEndpoint {
         };
 
         let page_output = match *ssr_chunk.await? {
-            SsrChunk::NodeJs { entry } => {
+            SsrChunk::NodeJs {
+                entry,
+                dynamic_entries,
+            } => {
                 let pages_manifest = self.pages_manifest(entry);
                 server_assets.push(pages_manifest);
                 server_assets.push(entry);
+                server_assets.extend(dynamic_entries.await?.iter().copied());
 
                 let node_root = this.pages_project.project().node_root();
-
-                //create_react_lodable_manifest2(entry).await?;
 
                 let mut lodable_manifest: HashMap<String, LodableManifest> = Default::default();
                 lodable_manifest.insert("dummy_page_node".to_string(), LodableManifest::default());
@@ -903,7 +955,6 @@ impl PageEndpoint {
                 ));
                 server_assets.push(middleware_manifest_v2);
 
-                //create_react_lodable_manifest2(entry).await?;
                 let mut lodable_manifest: HashMap<String, LodableManifest> = Default::default();
                 lodable_manifest.insert("dummy_page_edge".to_string(), LodableManifest::default());
 
@@ -1055,6 +1106,11 @@ impl PageEndpointOutput {
 
 #[turbo_tasks::value]
 pub enum SsrChunk {
-    NodeJs { entry: Vc<Box<dyn OutputAsset>> },
-    Edge { files: Vc<OutputAssets> },
+    NodeJs {
+        entry: Vc<Box<dyn OutputAsset>>,
+        dynamic_entries: Vc<Vec<Vc<Box<dyn OutputAsset>>>>,
+    },
+    Edge {
+        files: Vc<OutputAssets>,
+    },
 }
